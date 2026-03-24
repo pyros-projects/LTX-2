@@ -122,9 +122,14 @@ class OptimizationConfig(ConfigBaseModel):
         description="Maximum gradient norm for clipping",
     )
 
-    optimizer_type: Literal["adamw", "adamw8bit"] = Field(
+    optimizer_type: Literal["adamw", "adamw8bit", "adafactor"] = Field(
         default="adamw",
         description="Type of optimizer to use for training",
+    )
+
+    optimizer_args: dict = Field(
+        default_factory=dict,
+        description="Additional keyword arguments passed to the optimizer constructor",
     )
 
     scheduler_type: Literal[

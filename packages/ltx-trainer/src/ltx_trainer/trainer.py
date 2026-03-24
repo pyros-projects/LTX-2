@@ -972,15 +972,25 @@ class LtxvTrainer:
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
+        extra_args = dict(opt_cfg.optimizer_args)
         if opt_cfg.optimizer_type == "adamw":
             logger.debug("OPTIMIZER: constructing AdamW")
-            optimizer = AdamW(self._trainable_params, lr=lr)
+            optimizer = AdamW(self._trainable_params, lr=lr, **extra_args)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
             logger.debug("OPTIMIZER: constructing AdamW8bit")
-            optimizer = AdamW8bit(self._trainable_params, lr=lr)
+            optimizer = AdamW8bit(self._trainable_params, lr=lr, **extra_args)
+        elif opt_cfg.optimizer_type == "adafactor":
+            from transformers.optimization import Adafactor  # noqa: PLC0415
+
+            logger.debug("OPTIMIZER: constructing Adafactor")
+            # The trainer always supplies a manual learning rate, so default Adafactor
+            # into the compatible non-relative-step mode unless the user overrides it.
+            extra_args.setdefault("relative_step", False)
+            extra_args.setdefault("scale_parameter", False)
+            optimizer = Adafactor(self._trainable_params, lr=lr, **extra_args)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
