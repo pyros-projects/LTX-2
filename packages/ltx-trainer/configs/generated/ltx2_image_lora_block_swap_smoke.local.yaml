@@ -1,0 +1,83 @@
+model:
+  model_path: "/home/pyro/models/comfy/diffusion_models/ltx-2.3-22b-dev.safetensors"
+  text_encoder_path: "/home/pyro/models/gemma/gemma-3-12b-it-qat-q4_0-unquantized"
+  training_mode: "lora"
+  load_checkpoint: null
+
+lora:
+  rank: 4
+  alpha: 4
+  dropout: 0.0
+  target_modules:
+    - "to_k"
+    - "to_q"
+    - "to_v"
+    - "to_out.0"
+
+training_strategy:
+  name: "text_to_video"
+  first_frame_conditioning_p: 1
+  with_audio: false
+  audio_latents_dir: "audio_latents"
+
+optimization:
+  learning_rate: 1e-4
+  steps: 5
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: "adamw8bit"
+  scheduler_type: "linear"
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: "bf16"
+  quantization: null
+  load_text_encoder_in_8bit: true
+  blocks_to_swap: 8
+  use_pinned_memory_for_block_swap: false
+
+data:
+  preprocessed_data_root: "/home/pyro/repos/LTX-2/_data"
+  num_dataloader_workers: 2
+
+validation:
+  prompts: []
+  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+  images: null
+  video_dims: [512, 512, 1]
+  frame_rate: 1
+  seed: 42
+  inference_steps: 30
+  interval: null
+  videos_per_prompt: 1
+  guidance_scale: 4.0
+  stg_scale: 1.0
+  stg_blocks: [29]
+  stg_mode: "stg_v"
+  generate_audio: false
+  skip_initial_validation: true
+
+checkpoints:
+  interval: null
+  keep_last_n: -1
+  precision: "bfloat16"
+
+flow_matching:
+  timestep_sampling_mode: "shifted_logit_normal"
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: false
+  project: "ltx-2-trainer"
+  entity: null
+  tags: ["ltx2.3", "image-only", "lora", "bf16-base", "block-swap-smoke"]
+  log_validation_videos: false
+
+seed: 42
+output_dir: "/home/pyro/repos/LTX-2/_data/_out/block_swap_smoke"

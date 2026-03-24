@@ -49,11 +49,45 @@ SKIP_ROOT_MODULES = {
 }
 
 
+def should_restore_original_device(
+    original_device: torch.device | str,
+    target_device: torch.device | str,
+    keep_quantized_model_on_device: bool,
+) -> bool:
+    """Whether quantized weights should be moved back to the model's original device."""
+    original_device = torch.device(original_device)
+    target_device = torch.device(target_device)
+
+    if keep_quantized_model_on_device and target_device.type != original_device.type:
+        return False
+
+    return True
+
+
+def should_offload_after_quantization(keep_quantized_model_on_device: bool) -> bool:
+    """Whether quantized modules should be moved back to CPU after quantization."""
+    return not keep_quantized_model_on_device
+
+
+def should_skip_root_module_quantization(name: str) -> bool:
+    """Whether a top-level module should be skipped entirely in blockwise quantization."""
+    if name in SKIP_ROOT_MODULES:
+        return True
+
+    # AdaLN/timestep embedding paths are documented as incompatible with int4 TinyGemm
+    # because their inputs originate in float32 sinusoidal embeddings.
+    if "adaln" in name:
+        return True
+
+    return False
+
+
 def quantize_model(
     model: torch.nn.Module,
     precision: QuantizationOptions,
     quantize_activations: bool = False,
     device: torch.device | str | None = None,
+    keep_quantized_model_on_device: bool = False,
 ) -> torch.nn.Module:
     """
     Quantize a model using optimum-quanto.
@@ -65,6 +99,9 @@ def quantize_model(
         precision: The quantization precision (e.g. "int8-quanto", "fp8-quanto").
         quantize_activations: Whether to quantize activations in addition to weights.
         device: Device to use for quantization. If None, uses CUDA if available, else CPU.
+        keep_quantized_model_on_device: If True, do not move the quantized model back to its
+            original device after quantization. Useful for single-GPU training with qint4
+            TinyGemm weights, where CPU->CUDA moves can trigger expensive repacking.
     Returns:
         The quantized model.
     """
@@ -94,6 +131,7 @@ def quantize_model(
             weight_quant=weight_quant,
             activations_quant=activations_quant,
             device=device,
+            offload_after_quantization=should_offload_after_quantization(keep_quantized_model_on_device),
         )
     else:
         # Fallback: quantize entire model at once
@@ -101,8 +139,11 @@ def quantize_model(
         quantize(model, weights=weight_quant, activations=activations_quant, exclude=EXCLUDE_PATTERNS)
         freeze(model)
 
-    # Restore model to original device
-    model.to(original_device)
+    if should_restore_original_device(original_device, device, keep_quantized_model_on_device):
+        logger.debug(f"Restoring quantized model to original device: {original_device}")
+        model.to(original_device)
+    else:
+        logger.debug(f"Keeping quantized model on quantization device: {device}")
 
     return model
 
@@ -112,6 +153,7 @@ def _quantize_blockwise(
     weight_quant: torch.dtype,
     activations_quant: torch.dtype | None,
     device: torch.device,
+    offload_after_quantization: bool,
 ) -> None:
     """Quantize a model block-by-block using optimum-quanto.
     This approach:
@@ -144,8 +186,10 @@ def _quantize_blockwise(
             quantize(block, weights=weight_quant, activations=activations_quant, exclude=EXCLUDE_PATTERNS)
             freeze(block)
 
-            # Move back to CPU to free up VRAM for next block
-            block.to("cpu", non_blocking=True)
+            # Move back to CPU to free up VRAM for next block, unless we're keeping the
+            # quantized model resident on the target device for immediate single-GPU training.
+            if offload_after_quantization:
+                block.to("cpu", non_blocking=True)
 
             progress.advance(task)
 
@@ -157,15 +201,18 @@ def _quantize_blockwise(
         if name == "transformer_blocks":
             continue  # Already quantized
 
-        if name in SKIP_ROOT_MODULES:
+        if should_skip_root_module_quantization(name):
             logger.debug(f"Skipping quantization for module: {name}")
+            if not offload_after_quantization:
+                module.to(device, dtype=original_dtype, non_blocking=True)
             continue  # Don't quantize these modules
 
         # Move to device, quantize, freeze, move back
         module.to(device, dtype=original_dtype, non_blocking=True)
         quantize(module, weights=weight_quant, activations=activations_quant, exclude=EXCLUDE_PATTERNS)
         freeze(module)
-        module.to("cpu", non_blocking=True)
+        if offload_after_quantization:
+            module.to("cpu", non_blocking=True)
 
 
 def _get_quanto_dtype(precision: QuantizationOptions) -> torch.dtype:

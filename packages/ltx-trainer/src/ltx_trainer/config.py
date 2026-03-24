@@ -167,6 +167,17 @@ class AccelerationConfig(ConfigBaseModel):
         description="Whether to load the text encoder in 8-bit precision to save memory",
     )
 
+    blocks_to_swap: int = Field(
+        default=0,
+        description="How many transformer blocks to swap between CPU and GPU during single-GPU training.",
+        ge=0,
+    )
+
+    use_pinned_memory_for_block_swap: bool = Field(
+        default=False,
+        description="Whether to use pinned CPU memory for block swap transfers.",
+    )
+
 
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""
@@ -516,5 +527,8 @@ class LtxTrainerConfig(ConfigBaseModel):
         # Check that LoRA config is provided when using video_to_video strategy
         if self.training_strategy.name == "video_to_video" and self.model.training_mode != "lora":
             raise ValueError("Training mode must be 'lora' when using video_to_video strategy")
+
+        if self.acceleration.blocks_to_swap > 0 and self.model.training_mode != "lora":
+            raise ValueError("Block swapping is only supported when training_mode is 'lora'")
 
         return self

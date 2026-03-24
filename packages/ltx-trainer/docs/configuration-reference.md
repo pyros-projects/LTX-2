@@ -215,18 +215,31 @@ Hardware acceleration and compute optimization settings.
 
 ```yaml
 acceleration:
-  mixed_precision_mode: "bf16"      # "no", "fp16", or "bf16"
-  quantization: null                # Quantization options
-  load_text_encoder_in_8bit: false  # Load text encoder in 8-bit
+  mixed_precision_mode: "bf16"              # "no", "fp16", or "bf16"
+  quantization: null                        # Quantization options
+  load_text_encoder_in_8bit: false          # Load text encoder in 8-bit
+  blocks_to_swap: 0                         # Transformer blocks to swap on single GPU
+  use_pinned_memory_for_block_swap: false   # Faster transfers, higher host-memory pressure
 ```
 
 **Key parameters:**
 
-| Parameter                   | Description                                                                        |
-|-----------------------------|------------------------------------------------------------------------------------|
-| `mixed_precision_mode`      | Precision mode - `"bf16"` recommended for modern GPUs                              |
-| `quantization`              | Model quantization: `null`, `"int8-quanto"`, `"int4-quanto"`, `"fp8-quanto"`, etc. |
-| `load_text_encoder_in_8bit` | Load the Gemma text encoder in 8-bit to save GPU memory                            |
+| Parameter                           | Description                                                                        |
+|-------------------------------------|------------------------------------------------------------------------------------|
+| `mixed_precision_mode`              | Precision mode - `"bf16"` recommended for modern GPUs                              |
+| `quantization`                      | Model quantization: `null`, `"int8-quanto"`, `"int4-quanto"`, `"fp8-quanto"`, etc. |
+| `load_text_encoder_in_8bit`         | Load the Gemma text encoder in 8-bit to save GPU memory                            |
+| `blocks_to_swap`                    | Number of transformer blocks to swap between CPU and GPU during single-GPU LoRA training |
+| `use_pinned_memory_for_block_swap`  | Use pinned CPU memory for swap transfers; can improve transfer speed at the cost of higher host-memory usage |
+
+> [!NOTE]
+> Block swapping is currently intended for **single-GPU LoRA runs**. Distributed training modes are not supported by
+> the v1 implementation.
+
+> [!WARNING]
+> `quantization + block swap` is supported as an opt-in startup path, but packed-weight behavior can still vary by
+> quantization mode. `int8-quanto` and `int2-quanto` are expected to be the safer starting points. `int4-quanto`
+> remains the most likely to show slowdowns or fragile device-move behavior because of TinyGemm packing details.
 
 ### DataConfig
 

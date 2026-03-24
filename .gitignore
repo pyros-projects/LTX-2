@@ -19,6 +19,7 @@ checkpoints/
 .DS_Store
 tmp
 .wandb
+_data/
 
 # Model checkpoints
 *.ckpt

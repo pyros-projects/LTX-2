@@ -1,6 +1,7 @@
 import os
 import time
 import warnings
+from collections import Counter
 from pathlib import Path
 from typing import Callable
 
@@ -25,7 +26,7 @@ from torch.optim.lr_scheduler import (
     StepLR,
 )
 from torch.utils.data import DataLoader
-from torchvision.transforms import functional as F  # noqa: N812
+from torchvision.transforms import functional as F
 
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
@@ -62,6 +63,7 @@ if not IS_MAIN_PROCESS:
 StepCallback = Callable[[int, int, list[Path]], None]  # (step, total, list[sampled_video_path]) -> None
 
 MEMORY_CHECK_INTERVAL = 200
+FIRST_STEP_TRACE_LIMIT = 25
 
 
 class TrainingStats(BaseModel):
@@ -75,22 +77,302 @@ class TrainingStats(BaseModel):
     num_processes: int
 
 
+def should_keep_quantized_model_on_device(
+    world_size: str | None = None,
+    cuda_available: bool | None = None,
+) -> bool:
+    """Decide whether single-process startup should keep quantized weights on the target device."""
+    if cuda_available is None:
+        cuda_available = torch.cuda.is_available()
+
+    if world_size is None:
+        world_size = os.environ.get("WORLD_SIZE", "1")
+
+    try:
+        process_count = int(world_size)
+    except (TypeError, ValueError):
+        process_count = 1
+
+    return cuda_available and process_count <= 1
+
+
+def get_base_transformer_model(transformer: torch.nn.Module) -> torch.nn.Module:
+    """Return the underlying transformer model when wrapped by PEFT."""
+    return transformer.get_base_model() if hasattr(transformer, "get_base_model") else transformer
+
+
+def should_enable_block_swap(
+    distributed_type: DistributedType,
+    training_mode: str,
+    blocks_to_swap: int,
+) -> bool:
+    """Whether block swap should be enabled for the current run."""
+    return distributed_type == DistributedType.NO and training_mode == "lora" and blocks_to_swap > 0
+
+
+def enable_block_swap_for_training(
+    transformer: torch.nn.Module,
+    device: torch.device,
+    blocks_to_swap: int,
+    use_pinned_memory: bool,
+) -> None:
+    """Enable block swap on the base transformer and prepare initial residency."""
+    base_transformer = get_base_transformer_model(transformer)
+    base_transformer.enable_block_swap(
+        blocks_to_swap=blocks_to_swap,
+        device=device,
+        supports_backward=True,
+        use_pinned_memory=use_pinned_memory,
+    )
+    base_transformer.move_to_device_except_swap_blocks(device)
+    base_transformer.prepare_block_swap_before_forward()
+
+
+def restore_block_swap_residency(transformer: torch.nn.Module, device: torch.device) -> None:
+    """Restore intended swap residency after wrapping or device placement."""
+    base_transformer = get_base_transformer_model(transformer)
+    if getattr(base_transformer, "blocks_to_swap", 0) <= 0:
+        return
+
+    base_transformer.move_to_device_except_swap_blocks(device)
+    base_transformer.prepare_block_swap_before_forward()
+
+
+def collect_expected_swap_cpu_module_prefixes(transformer: torch.nn.Module) -> set[str]:
+    """Return module-name prefixes that are expected to stay on CPU due to block swap."""
+    base_transformer = get_base_transformer_model(transformer)
+    blocks_to_swap = int(getattr(base_transformer, "blocks_to_swap", 0) or 0)
+    transformer_blocks = getattr(base_transformer, "transformer_blocks", None)
+
+    if blocks_to_swap <= 0 or transformer_blocks is None:
+        return set()
+
+    total_blocks = len(transformer_blocks)
+    start_idx = max(total_blocks - blocks_to_swap, 0)
+    return {f"transformer_blocks.{idx}" for idx in range(start_idx, total_blocks)}
+
+
+def filter_unexpected_cpu_modules(cpu_modules: list[str], expected_prefixes: set[str]) -> list[str]:
+    """Filter out CPU modules that are expected because of configured block swapping."""
+    if not expected_prefixes:
+        return list(cpu_modules)
+
+    return [
+        module_name
+        for module_name in cpu_modules
+        if not any(module_name == prefix or module_name.startswith(f"{prefix}.") for prefix in expected_prefixes)
+    ]
+
+
+def collect_module_device_summary(module: torch.nn.Module) -> dict[str, object]:
+    """Collect parameter/buffer device distribution and modules with CPU state."""
+    parameter_devices = Counter(str(param.device) for _, param in module.named_parameters())
+    buffer_devices = Counter(str(buf.device) for _, buf in module.named_buffers())
+
+    cpu_parameter_modules = sorted(
+        {
+            name.rsplit(".", 1)[0] if "." in name else ""
+            for name, param in module.named_parameters()
+            if param.device.type == "cpu"
+        }
+    )
+    cpu_buffer_modules = sorted(
+        {
+            name.rsplit(".", 1)[0] if "." in name else ""
+            for name, buf in module.named_buffers()
+            if buf.device.type == "cpu"
+        }
+    )
+
+    return {
+        "parameter_devices": dict(parameter_devices),
+        "buffer_devices": dict(buffer_devices),
+        "cpu_parameter_modules": cpu_parameter_modules,
+        "cpu_buffer_modules": cpu_buffer_modules,
+    }
+
+
+def compute_step_timing(elapsed_seconds: float, gradient_accumulation_steps: int) -> tuple[float, float]:
+    """Return (microstep_seconds, optimization_step_seconds)."""
+    return elapsed_seconds, elapsed_seconds * gradient_accumulation_steps
+
+
 class LtxvTrainer:
     def __init__(self, trainer_config: LtxTrainerConfig) -> None:
         self._config = trainer_config
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
-        self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
-        self._load_models()
-        self._setup_accelerator()
-        self._collect_trainable_params()
-        self._load_checkpoint()
-        self._prepare_models_for_training()
+        self._cached_validation_embeddings = self._time_init_stage(
+            "cache_validation_embeddings",
+            self._load_text_encoder_and_cache_embeddings,
+        )
+        self._time_init_stage("load_models", self._load_models)
+        self._time_init_stage("setup_accelerator", self._setup_accelerator)
+        self._time_init_stage("collect_trainable_params", self._collect_trainable_params)
+        self._time_init_stage("load_checkpoint", self._load_checkpoint)
+        self._time_init_stage("prepare_models_for_training", self._prepare_models_for_training)
         self._dataset = None
         self._global_step = -1
         self._checkpoint_paths = []
-        self._init_wandb()
+        self._did_trace_first_step = False
+        self._time_init_stage("init_wandb", self._init_wandb)
+
+    def _time_init_stage(self, name: str, fn: Callable[[], object]) -> object:
+        """Run an initialization stage with detailed timing logs."""
+        logger.debug(f"INIT START: {name}")
+        start_time = time.time()
+        result = fn()
+        elapsed = time.time() - start_time
+        logger.debug(f"INIT DONE: {name} in {elapsed:.2f}s")
+        return result
+
+    def _log_transformer_device_summary(self, stage: str) -> None:
+        """Log exact parameter/buffer device placement for the current transformer."""
+        summary = collect_module_device_summary(self._transformer)
+        expected_swap_prefixes = collect_expected_swap_cpu_module_prefixes(self._transformer)
+        logger.debug(
+            f"DEVICE SUMMARY [{stage}] params={summary['parameter_devices']} "
+            f"buffers={summary['buffer_devices']}"
+        )
+
+        cpu_param_modules = summary["cpu_parameter_modules"]
+        cpu_buffer_modules = summary["cpu_buffer_modules"]
+        if cpu_param_modules:
+            logger.debug(
+                f"DEVICE SUMMARY [{stage}] CPU parameter modules "
+                f"(showing up to {FIRST_STEP_TRACE_LIMIT}): {cpu_param_modules[:FIRST_STEP_TRACE_LIMIT]}"
+            )
+            unexpected_cpu_params = filter_unexpected_cpu_modules(cpu_param_modules, expected_swap_prefixes)
+            if unexpected_cpu_params:
+                logger.debug(
+                    f"DEVICE SUMMARY [{stage}] unexpected CPU parameter modules "
+                    f"(showing up to {FIRST_STEP_TRACE_LIMIT}): {unexpected_cpu_params[:FIRST_STEP_TRACE_LIMIT]}"
+                )
+        if cpu_buffer_modules:
+            logger.debug(
+                f"DEVICE SUMMARY [{stage}] CPU buffer modules "
+                f"(showing up to {FIRST_STEP_TRACE_LIMIT}): {cpu_buffer_modules[:FIRST_STEP_TRACE_LIMIT]}"
+            )
+            unexpected_cpu_buffers = filter_unexpected_cpu_modules(cpu_buffer_modules, expected_swap_prefixes)
+            if unexpected_cpu_buffers:
+                logger.debug(
+                    f"DEVICE SUMMARY [{stage}] unexpected CPU buffer modules "
+                    f"(showing up to {FIRST_STEP_TRACE_LIMIT}): {unexpected_cpu_buffers[:FIRST_STEP_TRACE_LIMIT]}"
+                )
+
+    def _trace_first_training_step(self, batch: dict[str, dict[str, Tensor]]) -> None:  # noqa: PLR0915
+        """Trace the first step to identify any modules that actually execute on CPU."""
+        if self._did_trace_first_step:
+            return
+
+        self._did_trace_first_step = True
+        transformer = get_base_transformer_model(self._transformer)
+        expected_swap_prefixes = collect_expected_swap_cpu_module_prefixes(self._transformer)
+        trace_records: dict[str, dict[str, object]] = {}
+        hooks = []
+
+        def extract_tensor_devices(obj: object) -> set[str]:
+            devices: set[str] = set()
+            if isinstance(obj, torch.Tensor):
+                devices.add(str(obj.device))
+            elif isinstance(obj, (list, tuple)):
+                for item in obj:
+                    devices.update(extract_tensor_devices(item))
+            elif isinstance(obj, dict):
+                for item in obj.values():
+                    devices.update(extract_tensor_devices(item))
+            return devices
+
+        def add_hooks() -> None:
+            for name, module in transformer.named_modules():
+                if name == "":
+                    continue
+
+                def pre_hook(mod, args, module_name=name) -> None:  # noqa: ANN001
+                    record = trace_records.setdefault(
+                        module_name,
+                        {
+                            "input_devices": set(),
+                            "param_devices": set(),
+                            "buffer_devices": set(),
+                            "elapsed_seconds": 0.0,
+                            "calls": 0,
+                        },
+                    )
+                    record["input_devices"].update(extract_tensor_devices(args))
+                    record["param_devices"].update(str(p.device) for p in mod.parameters(recurse=False))
+                    record["buffer_devices"].update(str(b.device) for b in mod.buffers(recurse=False))
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    record["_start_time"] = time.perf_counter()
+
+                def post_hook(mod, args, output, module_name=name) -> None:  # noqa: ANN001, ARG001
+                    record = trace_records[module_name]
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    start_time = record.pop("_start_time", None)
+                    if start_time is not None:
+                        record["elapsed_seconds"] += time.perf_counter() - start_time
+                    record["calls"] += 1
+                    record["output_devices"] = sorted(extract_tensor_devices(output))
+
+                hooks.append(module.register_forward_pre_hook(pre_hook))
+                hooks.append(module.register_forward_hook(post_hook))
+
+        logger.debug("FIRST STEP TRACE: registering module hooks")
+        add_hooks()
+        try:
+            self._training_step(batch)
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        cpu_records = []
+        unexpected_cpu_records = []
+        for module_name, record in trace_records.items():
+            input_devices = sorted(record.get("input_devices", set()))
+            param_devices = sorted(record.get("param_devices", set()))
+            buffer_devices = sorted(record.get("buffer_devices", set()))
+            output_devices = record.get("output_devices", [])
+            if any(
+                device.startswith("cpu")
+                for device in (*input_devices, *param_devices, *buffer_devices, *output_devices)
+            ):
+                cpu_records.append((module_name, record))
+                if not filter_unexpected_cpu_modules([module_name], expected_swap_prefixes):
+                    continue
+                unexpected_cpu_records.append((module_name, record))
+
+        logger.debug(
+            f"FIRST STEP TRACE: executed {len(trace_records)} modules, "
+            f"cpu_involved={len(cpu_records)} unexpected_cpu_involved={len(unexpected_cpu_records)}"
+        )
+        for module_name, record in unexpected_cpu_records[:FIRST_STEP_TRACE_LIMIT]:
+            logger.debug(
+                "FIRST STEP TRACE CPU "
+                f"{module_name}: inputs={sorted(record.get('input_devices', set()))} "
+                f"params={sorted(record.get('param_devices', set()))} "
+                f"buffers={sorted(record.get('buffer_devices', set()))} "
+                f"outputs={record.get('output_devices', [])} "
+                f"calls={record.get('calls', 0)} "
+                f"time={record.get('elapsed_seconds', 0.0):.4f}s"
+            )
+
+        slowest = sorted(
+            trace_records.items(),
+            key=lambda item: float(item[1].get("elapsed_seconds", 0.0)),
+            reverse=True,
+        )[:FIRST_STEP_TRACE_LIMIT]
+        for module_name, record in slowest:
+            logger.debug(
+                "FIRST STEP TRACE SLOW "
+                f"{module_name}: inputs={sorted(record.get('input_devices', set()))} "
+                f"params={sorted(record.get('param_devices', set()))} "
+                f"outputs={record.get('output_devices', [])} "
+                f"calls={record.get('calls', 0)} "
+                f"time={record.get('elapsed_seconds', 0.0):.4f}s"
+            )
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -112,10 +394,10 @@ class LtxvTrainer:
         set_seed(cfg.seed)
         logger.debug(f"Process {self._accelerator.process_index} using seed: {cfg.seed}")
 
-        self._init_optimizer()
-        self._init_dataloader()
+        self._time_init_stage("init_optimizer", self._init_optimizer)
+        self._time_init_stage("init_dataloader", self._init_dataloader)
         data_iter = iter(self._dataloader)
-        self._init_timestep_sampler()
+        self._time_init_stage("init_timestep_sampler", self._init_timestep_sampler)
 
         # Synchronize all processes after initialization
         self._accelerator.wait_for_everyone()
@@ -166,6 +448,9 @@ class LtxvTrainer:
                     is_optimization_step = (step + 1) % cfg.optimization.gradient_accumulation_steps == 0
                     if is_optimization_step:
                         self._global_step += 1
+
+                    if step == 0:
+                        self._trace_first_training_step(batch)
 
                     loss = self._training_step(batch)
                     self._accelerator.backward(loss)
@@ -219,12 +504,15 @@ class LtxvTrainer:
 
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
-                    step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
+                    microstep_time, optimization_step_time = compute_step_timing(
+                        elapsed_seconds=time.time() - step_start_time,
+                        gradient_accumulation_steps=cfg.optimization.gradient_accumulation_steps,
+                    )
 
                     progress.update_training(
                         loss=loss.item(),
                         lr=current_lr,
-                        step_time=step_time,
+                        step_time=optimization_step_time,
                         advance=is_optimization_step,
                     )
 
@@ -234,7 +522,8 @@ class LtxvTrainer:
                             {
                                 "train/loss": loss.item(),
                                 "train/learning_rate": current_lr,
-                                "train/step_time": step_time,
+                                "train/step_time": optimization_step_time,
+                                "train/microstep_time": microstep_time,
                                 "train/global_step": self._global_step,
                             }
                         )
@@ -251,7 +540,8 @@ class LtxvTrainer:
                         logger.info(
                             f"Step {self._global_step}/{cfg.optimization.steps} - "
                             f"Loss: {loss.item():.4f}, LR: {current_lr:.2e}, "
-                            f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
+                            f"Microstep: {microstep_time:.2f}s, "
+                            f"OptStep: {optimization_step_time:.2f}s, Total Time: {total_time}",
                         )
 
                     # Sample GPU memory periodically
@@ -452,7 +742,9 @@ class LtxvTrainer:
             self._transformer = quantize_model(
                 self._transformer,
                 precision=self._config.acceleration.quantization,
+                keep_quantized_model_on_device=should_keep_quantized_model_on_device(),
             )
+            self._log_transformer_device_summary("after_quantize")
 
         # Freeze all models. We later unfreeze the transformer based on training mode.
         # Note: embedding_connectors are already frozen (they come from the frozen text encoder)
@@ -538,6 +830,7 @@ class LtxvTrainer:
 
     def _prepare_models_for_training(self) -> None:
         """Prepare models for training with Accelerate."""
+        logger.debug("Preparing models for training with Accelerate")
 
         # For FSDP + LoRA: Cast entire model to FP32.
         # FSDP requires uniform dtype across all parameters in wrapped modules.
@@ -549,11 +842,12 @@ class LtxvTrainer:
 
         # Enable gradient checkpointing if requested
         # For PeftModel, we need to access the underlying base model
-        transformer = (
-            self._transformer.get_base_model() if hasattr(self._transformer, "get_base_model") else self._transformer
-        )
+        transformer = get_base_transformer_model(self._transformer)
 
         transformer.set_gradient_checkpointing(self._config.optimization.enable_gradient_checkpointing)
+
+        if self._config.acceleration.blocks_to_swap > 0 and self._accelerator.distributed_type != DistributedType.NO:
+            raise ValueError("Block swapping is currently supported only for single-GPU runs.")
 
         # Keep frozen models on CPU for memory efficiency
         self._vae_decoder = self._vae_decoder.to("cpu")
@@ -562,12 +856,48 @@ class LtxvTrainer:
 
         # Embedding connectors are already on GPU from _load_text_encoder_and_cache_embeddings
 
+        if should_enable_block_swap(
+            self._accelerator.distributed_type,
+            self._config.model.training_mode,
+            self._config.acceleration.blocks_to_swap,
+        ):
+            enable_block_swap_for_training(
+                self._transformer,
+                self._accelerator.device,
+                self._config.acceleration.blocks_to_swap,
+                self._config.acceleration.use_pinned_memory_for_block_swap,
+            )
+            self._log_transformer_device_summary("after_enable_block_swap")
+
+        # For single-GPU quantized runs, quantize_model() can keep the quantized transformer on
+        # the target CUDA device already. Avoid forcing a second full-model device transfer here.
+        if self._accelerator.distributed_type == DistributedType.NO and (
+            self._config.acceleration.quantization or self._config.acceleration.blocks_to_swap > 0
+        ):
+            self._log_transformer_device_summary("before_prepare")
+
         # noinspection PyTypeChecker
+        logger.debug("Calling Accelerator.prepare() for transformer")
         self._transformer = self._accelerator.prepare(self._transformer)
+        logger.debug("Accelerator.prepare() completed for transformer")
+        self._log_transformer_device_summary("after_prepare")
+
+        if should_enable_block_swap(
+            self._accelerator.distributed_type,
+            self._config.model.training_mode,
+            self._config.acceleration.blocks_to_swap,
+        ):
+            restore_block_swap_residency(self._transformer, self._accelerator.device)
+            self._log_transformer_device_summary("after_restore_block_swap")
 
         # Log GPU memory usage after model preparation
-        vram_usage_gb = torch.cuda.memory_allocated() / 1024**3
-        logger.debug(f"GPU memory usage after models preparation: {vram_usage_gb:.2f} GB")
+        allocated_gb = torch.cuda.memory_allocated() / 1024**3
+        reserved_gb = torch.cuda.memory_reserved() / 1024**3
+        smi_gb = get_gpu_memory_gb(self._accelerator.device)
+        logger.debug(
+            "GPU memory usage after models preparation: "
+            f"allocated={allocated_gb:.2f} GB reserved={reserved_gb:.2f} GB nvidia-smi={smi_gb:.2f} GB"
+        )
 
     @staticmethod
     def _find_checkpoint(checkpoint_path: str | Path) -> Path | None:
@@ -601,14 +931,20 @@ class LtxvTrainer:
 
     def _init_dataloader(self) -> None:
         """Initialize the training data loader using the strategy's data sources."""
+        logger.debug("DATALOADER: initialization started")
         if self._dataset is None:
             # Get data sources from the training strategy
             data_sources = self._training_strategy.get_data_sources()
 
+            logger.debug(f"DATALOADER: building PrecomputedDataset from {self._config.data.preprocessed_data_root}")
             self._dataset = PrecomputedDataset(self._config.data.preprocessed_data_root, data_sources=data_sources)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
         num_workers = self._config.data.num_dataloader_workers
+        logger.debug(
+            "DATALOADER: creating torch DataLoader "
+            f"(batch_size={self._config.optimization.batch_size}, num_workers={num_workers})"
+        )
         dataloader = DataLoader(
             self._dataset,
             batch_size=self._config.optimization.batch_size,
@@ -619,7 +955,9 @@ class LtxvTrainer:
             persistent_workers=num_workers > 0,
         )
 
+        logger.debug("DATALOADER: calling Accelerator.prepare()")
         self._dataloader = self._accelerator.prepare(dataloader)
+        logger.debug("DATALOADER: Accelerator.prepare() completed")
 
     def _init_lora_weights(self) -> None:
         """Initialize LoRA weights for the transformer."""
@@ -630,24 +968,30 @@ class LtxvTrainer:
 
     def _init_optimizer(self) -> None:
         """Initialize the optimizer and learning rate scheduler."""
+        logger.debug("OPTIMIZER: initialization started")
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
         if opt_cfg.optimizer_type == "adamw":
+            logger.debug("OPTIMIZER: constructing AdamW")
             optimizer = AdamW(self._trainable_params, lr=lr)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
+            logger.debug("OPTIMIZER: constructing AdamW8bit")
             optimizer = AdamW8bit(self._trainable_params, lr=lr)
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
         # Add scheduler initialization
+        logger.debug(f"OPTIMIZER: creating scheduler of type {opt_cfg.scheduler_type}")
         lr_scheduler = self._create_scheduler(optimizer)
 
         # noinspection PyTypeChecker
+        logger.debug("OPTIMIZER: calling Accelerator.prepare()")
         self._optimizer, self._lr_scheduler = self._accelerator.prepare(optimizer, lr_scheduler)
+        logger.debug("OPTIMIZER: Accelerator.prepare() completed")
 
     def _create_scheduler(self, optimizer: torch.optim.Optimizer) -> LRScheduler | None:
         """Create learning rate scheduler based on config."""

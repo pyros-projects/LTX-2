@@ -5,6 +5,7 @@ import torch
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
 from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
+from ltx_core.model.transformer.block_swap import ModelOffloader
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import LTXRopeType
 from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
@@ -66,6 +67,8 @@ class LTXModel(torch.nn.Module):
     ):
         super().__init__()
         self._enable_gradient_checkpointing = False
+        self.blocks_to_swap = 0
+        self.offloader: ModelOffloader | None = None
         self.cross_attention_adaln = cross_attention_adaln
         self.use_middle_indices_grid = use_middle_indices_grid
         self.rope_type = rope_type
@@ -336,6 +339,59 @@ class LTXModel(torch.nn.Module):
         """
         self._enable_gradient_checkpointing = enable
 
+    def enable_block_swap(
+        self,
+        blocks_to_swap: int,
+        device: torch.device,
+        supports_backward: bool,
+        use_pinned_memory: bool = False,
+    ) -> None:
+        self.blocks_to_swap = blocks_to_swap
+        num_blocks = len(self.transformer_blocks)
+
+        if self.blocks_to_swap < 0:
+            raise ValueError(f"blocks_to_swap must be non-negative, got {self.blocks_to_swap}")
+        if self.blocks_to_swap > num_blocks - 1:
+            raise ValueError(
+                f"Cannot swap more than {num_blocks - 1} blocks. Requested {self.blocks_to_swap} blocks to swap."
+            )
+
+        self.offloader = ModelOffloader(
+            "ltx-transformer-block",
+            self.transformer_blocks,
+            num_blocks,
+            self.blocks_to_swap,
+            supports_backward=supports_backward,
+            device=device,
+            use_pinned_memory=use_pinned_memory,
+        )
+
+    def switch_block_swap_for_inference(self) -> None:
+        if self.blocks_to_swap and self.offloader is not None:
+            self.offloader.set_forward_only(True)
+            self.prepare_block_swap_before_forward()
+
+    def switch_block_swap_for_training(self) -> None:
+        if self.blocks_to_swap and self.offloader is not None:
+            self.offloader.set_forward_only(False)
+            self.prepare_block_swap_before_forward()
+
+    def move_to_device_except_swap_blocks(self, device: torch.device) -> None:
+        if self.blocks_to_swap:
+            saved_blocks = self.transformer_blocks
+            self.transformer_blocks = None
+            self.to(device)
+            self.transformer_blocks = saved_blocks
+            return
+
+        self.to(device)
+
+    def prepare_block_swap_before_forward(self) -> None:
+        if self.blocks_to_swap == 0 or self.offloader is None:
+            return
+
+        self.offloader.prepare_block_devices_before_forward(self.transformer_blocks)
+
     def _process_transformer_blocks(
         self,
         video: TransformerArgs | None,
@@ -345,7 +401,10 @@ class LTXModel(torch.nn.Module):
         """Process transformer blocks for LTXAV."""
 
         # Process transformer blocks
-        for block in self.transformer_blocks:
+        for block_idx, block in enumerate(self.transformer_blocks):
+            if self.blocks_to_swap and self.offloader is not None:
+                self.offloader.wait_for_block(block_idx)
+
             if self._enable_gradient_checkpointing and self.training:
                 # Use gradient checkpointing to save memory during training.
                 # With use_reentrant=False, we can pass dataclasses directly -
@@ -363,6 +422,9 @@ class LTXModel(torch.nn.Module):
                     audio=audio,
                     perturbations=perturbations,
                 )
+
+            if self.blocks_to_swap and self.offloader is not None:
+                self.offloader.submit_move_blocks_forward(self.transformer_blocks, block_idx)
 
         return video, audio
 
