@@ -7,7 +7,7 @@ TRAINER_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 # ---------------------------------------------------------------------------
 # Edit these paths
 # ---------------------------------------------------------------------------
-MODEL_PATH="/home/pyro/models/comfy/diffusion_models/ltx-2.3-22b-dev-fp8.safetensors"
+MODEL_PATH="/home/pyro/models/comfy/checkpoints/ltx-2.3-22b-dev.safetensors"
 GEMMA_DIR="/home/pyro/models/gemma/gemma-3-12b-it-qat-q4_0-unquantized"
 
 # Option A: point directly to an existing JSON/JSONL/CSV metadata file.
@@ -37,7 +37,7 @@ NUM_DATALOADER_WORKERS="2"
 # That means an FP8 checkpoint alone does not keep memory low here.
 # For 24GB, start with int4-quanto. If it still OOMs, last-resort options are int2-quanto
 # or a smaller base checkpoint.
-QUANTIZATION="int2-quanto"
+QUANTIZATION="int8-quanto"
 
 # Mode: preprocess | train | all
 MODE="${1:-all}"
@@ -112,8 +112,6 @@ training_strategy:
   with_audio: false
   audio_latents_dir: "audio_latents"
 
-hf download Lightricks/LTX-2.3 ltx-2.3-22b-dev.safetensors --local-dir /home/pyro/models/comfy/diffusion_models
-
 optimization:
   learning_rate: ${LEARNING_RATE}
   steps: ${TRAIN_STEPS}
@@ -129,27 +127,29 @@ acceleration:
   mixed_precision_mode: "bf16"
   quantization: "${QUANTIZATION}"
   load_text_encoder_in_8bit: true
+  blocks_to_swap: 12
+  use_pinned_memory_for_block_swap: false
 
 data:
   preprocessed_data_root: "${PREPROCESSED_ROOT}"
   num_dataloader_workers: ${NUM_DATALOADER_WORKERS}
 
 validation:
-  prompts: ["a woman doing a headsit pose"]
+  prompts: ["a pretty and skinny woman doing a headsit pose at home in her room, wearing casual gothic clothing. amateur candid shot", "a very skinny korean actress doing a headsit pose, wearing sleek expensive fashion. amateur candid shot. at the mall.", "a extremely skinny 20-year-old female topmodel doing a headsit pose, mixed Asian-European descent, amateur photo, low-lit, overexposure, Low-resolution photo, shot on a mobile phone, on a yoga mat inside a yoga studio"]
   negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
   images: null
-  video_dims: [512, 512, 1]
+  video_dims: [544, 960, 1]
   frame_rate: 1
   seed: 42
   inference_steps: 30
-  interval: 50
+  interval: null
   videos_per_prompt: 1
   guidance_scale: 4.0
   stg_scale: 1.0
   stg_blocks: [29]
   stg_mode: "stg_v"
   generate_audio: false
-  skip_initial_validation: false
+  skip_initial_validation: true
 
 checkpoints:
   interval: ${CHECKPOINT_INTERVAL}
