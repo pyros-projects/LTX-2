@@ -34,6 +34,22 @@ class EmbeddingsConnectorBatchingTests(unittest.TestCase):
         self.assertEqual(tuple(encoded.shape), (2, 128, 8))
         self.assertEqual(tuple(encoded_mask.shape), (2, 1, 1, 128))
 
+    def test_connector_handles_batched_split_rope(self) -> None:
+        connector = MODULE.Embeddings1DConnector(
+            attention_head_dim=4,
+            num_attention_heads=2,
+            num_layers=1,
+            num_learnable_registers=None,
+            rope_type=MODULE.LTXRopeType.SPLIT,
+        )
+        hidden_states = torch.randn(2, 256, 8)
+        attention_mask = torch.zeros(2, 1, 1, 256, dtype=hidden_states.dtype)
+
+        encoded, encoded_mask = connector(hidden_states, attention_mask)
+
+        self.assertEqual(tuple(encoded.shape), (2, 256, 8))
+        self.assertEqual(tuple(encoded_mask.shape), (2, 1, 1, 256))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -181,7 +181,7 @@ class Embeddings1DConnector(torch.nn.Module):
             hidden_states, attention_mask = self._replace_padded_with_learnable_registers(hidden_states, attention_mask)
 
         indices_grid = torch.arange(hidden_states.shape[1], dtype=torch.float32, device=hidden_states.device)
-        indices_grid = indices_grid[None, None, :]
+        indices_grid = indices_grid[None, None, :].expand(hidden_states.shape[0], -1, -1)
         freq_grid_generator = generate_freq_grid_np if self.double_precision_rope else generate_freq_grid_pytorch
         freqs_cis = precompute_freqs_cis(
             indices_grid=indices_grid,
