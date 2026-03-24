@@ -1,7 +1,7 @@
 # single-gpu-transformer-block-swap Specification
 
 ## Purpose
-TBD - created by archiving change add-ltx-block-swap. Update Purpose after archive.
+Define the expected behavior for single-GPU trainer-side transformer block swapping in LTX-2 LoRA runs so larger or safer-fit configurations can be enabled without changing the default non-swap training path.
 ## Requirements
 ### Requirement: Trainer configuration can enable transformer block swap
 The trainer SHALL provide configuration fields that let single-GPU LoRA runs opt into transformer block swapping without changing the default startup path for runs that do not enable swapping.
@@ -61,4 +61,3 @@ The codebase SHALL provide tests or equivalent structural verification for swap 
 #### Scenario: Structural checks cover startup residency preparation
 - **WHEN** automated tests run for swap-enabled startup helpers
 - **THEN** they MUST verify that the startup path can prepare non-swapped modules on the accelerator device without requiring all transformer blocks to remain resident there
-

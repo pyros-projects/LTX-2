@@ -33,9 +33,9 @@ optimization:
 
 acceleration:
     mixed_precision_mode: "bf16"
-    quantization: null
+    quantization: "int4-quanto"
     load_text_encoder_in_8bit: true
-    blocks_to_swap: 8
+    blocks_to_swap: 16
     use_pinned_memory_for_block_swap: false
 
 data:
