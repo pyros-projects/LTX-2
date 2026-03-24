@@ -144,10 +144,14 @@ class Embeddings1DConnector(torch.nn.Module):
         learnable_registers = torch.tile(self.learnable_registers, (num_registers_duplications, 1))
         attention_mask_binary = (attention_mask.squeeze(1).squeeze(1).unsqueeze(-1) >= -9000.0).int()
 
-        non_zero_hidden_states = hidden_states[:, attention_mask_binary.squeeze().bool(), :]
-        non_zero_nums = non_zero_hidden_states.shape[1]
-        pad_length = hidden_states.shape[1] - non_zero_nums
-        adjusted_hidden_states = torch.nn.functional.pad(non_zero_hidden_states, pad=(0, 0, 0, pad_length), value=0)
+        adjusted_hidden_states = []
+        for batch_hidden_states, batch_attention_mask in zip(hidden_states, attention_mask_binary, strict=False):
+            non_zero_hidden_states = batch_hidden_states[batch_attention_mask.squeeze(-1).bool(), :]
+            pad_length = hidden_states.shape[1] - non_zero_hidden_states.shape[0]
+            adjusted_hidden_states.append(
+                torch.nn.functional.pad(non_zero_hidden_states, pad=(0, 0, 0, pad_length), value=0)
+            )
+        adjusted_hidden_states = torch.stack(adjusted_hidden_states, dim=0)
         flipped_mask = torch.flip(attention_mask_binary, dims=[1])
         hidden_states = flipped_mask * adjusted_hidden_states + (1 - flipped_mask) * learnable_registers
 
