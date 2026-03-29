@@ -972,7 +972,7 @@ class LtxvTrainer:
 
     @contextmanager
     def _validation_sampling_lora_scope(self, transformer: torch.nn.Module):
-        """Temporarily activate a weighted validation adapter combining training and sampling LoRAs."""
+        """Temporarily activate the training and sampling LoRAs together without materializing a merged adapter."""
         sampling_lora_path = getattr(self._config.validation, "sampling_lora_weight", None)
         if sampling_lora_path is None:
             yield
@@ -984,41 +984,37 @@ class LtxvTrainer:
             return
 
         active_adapter = getattr(transformer, "active_adapter", "default")
-        mix_adapter = "__validation_sampling_mix__"
+        active_adapters = list(active_adapter) if isinstance(active_adapter, list) else [active_adapter]
+        combined_adapters = [*active_adapters]
+        if sampling_adapter not in combined_adapters:
+            combined_adapters.append(sampling_adapter)
         multiplier = float(getattr(self._config.validation, "sampling_lora_multiplier", 1.0))
 
-        if mix_adapter in transformer.peft_config:
-            transformer.delete_adapter(mix_adapter)
+        logger.info(
+            "Activating validation sampling LoRAs together: "
+            f"train_adapters={active_adapters} sampling_adapter={sampling_adapter} multiplier={multiplier}"
+        )
+
+        scaled_modules: list[tuple[object, float]] = []
+        peft_model = getattr(getattr(transformer, "base_model", None), "model", transformer)
+        for module in peft_model.modules():
+            scaling = getattr(module, "scaling", None)
+            if isinstance(scaling, dict) and sampling_adapter in scaling:
+                original_scaling = float(scaling[sampling_adapter])
+                scaling[sampling_adapter] = original_scaling * multiplier
+                scaled_modules.append((module, original_scaling))
 
         logger.info(
-            "Activating validation sampling LoRA mix: "
-            f"train_adapter={active_adapter} sampling_adapter={sampling_adapter} multiplier={multiplier}"
-        )
-        weighted_start_time = time.perf_counter()
-        logger.info(f"Validation sampling LoRA: calling add_weighted_adapter({mix_adapter})")
-        transformer.base_model.add_weighted_adapter(
-            [active_adapter, sampling_adapter],
-            [1.0, multiplier],
-            adapter_name=mix_adapter,
-            combination_type="cat",
-        )
-        logger.info(
-            f"Validation sampling LoRA: add_weighted_adapter completed in "
-            f"{time.perf_counter() - weighted_start_time:.2f}s"
+            "Validation sampling LoRA: scaled sampling adapter "
+            f"across {len(scaled_modules)} modules"
         )
 
         set_active_start_time = time.perf_counter()
-        transformer.set_adapter(mix_adapter)
+        transformer.base_model.set_adapter(combined_adapters, inference_mode=True)
+        transformer.active_adapter = combined_adapters
         logger.info(
-            f"Validation sampling LoRA: set_adapter({mix_adapter}) completed in "
+            f"Validation sampling LoRA: set_adapter({combined_adapters}) completed in "
             f"{time.perf_counter() - set_active_start_time:.2f}s"
-        )
-
-        freeze_mix_start_time = time.perf_counter()
-        transformer.set_requires_grad(mix_adapter, False)
-        logger.info(
-            "Validation sampling LoRA: set_requires_grad(False) for mix adapter completed in "
-            f"{time.perf_counter() - freeze_mix_start_time:.2f}s"
         )
         logger.debug(
             f"Validation sampling adapter state: active={getattr(transformer, 'active_adapter', None)} "
@@ -1028,10 +1024,10 @@ class LtxvTrainer:
         try:
             yield
         finally:
-            if active_adapter in transformer.peft_config:
-                transformer.set_adapter(active_adapter)
-            if hasattr(transformer, "delete_adapter"):
-                transformer.delete_adapter(mix_adapter)
+            for module, original_scaling in scaled_modules:
+                module.scaling[sampling_adapter] = original_scaling
+            transformer.base_model.set_adapter(active_adapter, inference_mode=False)
+            transformer.active_adapter = active_adapter
             logger.debug(
                 f"Validation sampling adapter restored: active={getattr(transformer, 'active_adapter', None)} "
                 f"available={sorted(getattr(transformer, 'peft_config', {}).keys())}"

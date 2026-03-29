@@ -33,6 +33,9 @@ SAMPLER_MODULE = _load_module("ltx_trainer_validation_sampler", "ltx_trainer/val
 class FakeBaseModel:
     def __init__(self) -> None:
         self.weighted_calls: list[tuple[list[str], list[float], str, str]] = []
+        self.set_calls: list[tuple[object, bool]] = []
+        self.model = torch.nn.Module()
+        self.model.lora_layer = FakeLoRALayer()
 
     def add_weighted_adapter(
         self,
@@ -42,6 +45,18 @@ class FakeBaseModel:
         combination_type: str = "svd",
     ) -> None:
         self.weighted_calls.append((adapters, weights, adapter_name, combination_type))
+
+    def set_adapter(self, adapter_name: object, inference_mode: bool = False) -> None:
+        self.set_calls.append((adapter_name, inference_mode))
+
+
+class FakeLoRALayer(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scaling = {
+            "default": 1.0,
+            "__validation_sampling__": 2.0,
+        }
 
 
 class FakePeftTransformer:
@@ -68,6 +83,9 @@ class FakePeftTransformer:
 
     def set_requires_grad(self, adapter_name: str, requires_grad: bool = True) -> None:
         self.grad_calls.append((adapter_name, requires_grad))
+
+    def modules(self):
+        return self.base_model.model.modules()
 
 
 class ValidationSamplingOverrideTests(unittest.TestCase):
@@ -176,23 +194,27 @@ class ValidationSamplingOverrideTests(unittest.TestCase):
             patch.object(TRAINER_MODULE, "set_peft_model_state_dict") as mock_set_state,
         ):
             with trainer._validation_sampling_lora_scope(transformer):
-                self.assertEqual(transformer.active_adapter, "__validation_sampling_mix__")
+                self.assertEqual(
+                    transformer.active_adapter,
+                    ["default", "__validation_sampling__"],
+                )
+                self.assertEqual(
+                    transformer.base_model.model.lora_layer.scaling["__validation_sampling__"],
+                    1.2,
+                )
 
         mock_set_state.assert_called_once()
         self.assertIn("__validation_sampling__", transformer.peft_config)
+        self.assertEqual(transformer.base_model.weighted_calls, [])
         self.assertEqual(
-            transformer.base_model.weighted_calls,
+            transformer.base_model.set_calls,
             [
-                (
-                    ["default", "__validation_sampling__"],
-                    [1.0, 0.6],
-                    "__validation_sampling_mix__",
-                    "cat",
-                )
+                (["default", "__validation_sampling__"], True),
+                ("default", False),
             ],
         )
         self.assertEqual(transformer.active_adapter, "default")
-        self.assertIn("__validation_sampling_mix__", transformer.deleted)
+        self.assertEqual(transformer.base_model.model.lora_layer.scaling["__validation_sampling__"], 2.0)
 
 
 if __name__ == "__main__":
