@@ -4,6 +4,7 @@ using the new ltx-core components (VideoLatentTools, AudioLatentTools, LatentSta
 """
 
 from dataclasses import dataclass, replace
+import time
 from typing import TYPE_CHECKING, Literal
 
 import torch
@@ -30,6 +31,7 @@ from ltx_core.model.transformer.model import X0Model
 from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
 from ltx_core.tools import AudioLatentTools, VideoLatentTools
 from ltx_core.types import AudioLatentShape, LatentState, SpatioTemporalScaleFactors, VideoLatentShape, VideoPixelShape
+from ltx_trainer import logger
 from ltx_trainer.progress import SamplingContext
 
 if TYPE_CHECKING:
@@ -40,6 +42,23 @@ if TYPE_CHECKING:
     from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcessor
 
 VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
+
+
+def _tensor_summary(name: str, tensor: Tensor | None) -> str:
+    if tensor is None:
+        return f"{name}=None"
+    return f"{name}(shape={tuple(tensor.shape)}, dtype={tensor.dtype}, device={tensor.device})"
+
+
+def _latent_state_summary(name: str, latent_state: LatentState | None) -> str:
+    if latent_state is None:
+        return f"{name}=None"
+    return (
+        f"{name}(latent_dtype={latent_state.latent.dtype}, latent_device={latent_state.latent.device}, "
+        f"latent_shape={tuple(latent_state.latent.shape)}, "
+        f"mask_dtype={latent_state.denoise_mask.dtype}, mask_device={latent_state.denoise_mask.device}, "
+        f"positions_dtype={latent_state.positions.dtype}, positions_device={latent_state.positions.device})"
+    )
 
 
 @dataclass
@@ -196,6 +215,13 @@ class ValidationSampler:
         """
         device = torch.device(device) if isinstance(device, str) else device
         self._validate_config(config)
+        logger.info(
+            "ValidationSampler.generate: "
+            f"device={device} frames={config.num_frames} size={config.width}x{config.height} "
+            f"guidance_scale={config.guidance_scale} sample_sigmas={'yes' if config.sample_sigmas is not None else 'no'} "
+            f"condition_image={'yes' if config.condition_image is not None else 'no'} "
+            f"reference_video={'yes' if config.reference_video is not None else 'no'}"
+        )
 
         # Route to appropriate generation method
         if config.reference_video is not None:
@@ -512,6 +538,19 @@ class ValidationSampler:
     ) -> tuple[LatentState, LatentState | None]:
         """Run the denoising loop using X0 prediction with CFG and optional STG."""
         sigmas = self._resolve_sigmas(config, device)
+        logger.info(
+            "ValidationSampler._run_denoising: "
+            f"sigmas_dtype={sigmas.dtype} sigmas_device={sigmas.device} sigmas={sigmas.detach().cpu().tolist()}"
+        )
+        logger.debug(
+            "ValidationSampler._run_denoising inputs: "
+            f"{_latent_state_summary('video_state', video_state)} "
+            f"{_latent_state_summary('audio_state', audio_state)} "
+            f"{_tensor_summary('v_ctx_pos', v_ctx_pos)} "
+            f"{_tensor_summary('a_ctx_pos', a_ctx_pos)} "
+            f"{_tensor_summary('v_ctx_neg', v_ctx_neg)} "
+            f"{_tensor_summary('a_ctx_neg', a_ctx_neg)}"
+        )
         stepper = EulerDiffusionStep()
         cfg_guider = CFGGuider(config.guidance_scale)
         stg_guider = STGGuider(config.stg_scale)
@@ -545,10 +584,19 @@ class ValidationSampler:
 
         # Wrap transformer with X0Model to convert velocity predictions to denoised outputs
         self._transformer.to(device)
+        try:
+            first_param = next(self._transformer.parameters())
+            logger.info(
+                "ValidationSampler transformer ready: "
+                f"param_dtype={first_param.dtype} param_device={first_param.device}"
+            )
+        except StopIteration:
+            logger.warning("ValidationSampler transformer has no parameters to inspect")
         x0_model = X0Model(self._transformer)
 
         with torch.autocast(device_type=str(device).split(":")[0], dtype=torch.bfloat16):
             for step_idx, sigma in enumerate(sigmas[:-1]):
+                step_start_time = time.perf_counter()
                 # Update modalities with current state and timesteps
                 video = replace(
                     video,
@@ -570,12 +618,26 @@ class ValidationSampler:
                 # Run model (positive pass) - X0Model returns denoised outputs
                 pos_video, pos_audio = x0_model(video=video, audio=audio, perturbations=None)
                 denoised_video, denoised_audio = pos_video, pos_audio
+                if step_idx == 0:
+                    logger.info(
+                        "ValidationSampler first step state: "
+                        f"{_tensor_summary('video.latent', video.latent)} "
+                        f"{_tensor_summary('video.context', video.context)} "
+                        f"{_tensor_summary('pos_video', pos_video)} "
+                        f"{_tensor_summary('pos_audio', pos_audio)}"
+                    )
 
                 # Apply CFG if guidance_scale != 1.0
                 if cfg_guider.enabled() and v_ctx_neg is not None:
                     video_neg = replace(video, context=v_ctx_neg)
                     audio_neg = replace(audio, context=a_ctx_neg) if audio is not None else None
                     neg_video, neg_audio = x0_model(video=video_neg, audio=audio_neg, perturbations=None)
+                    if step_idx == 0:
+                        logger.info(
+                            "ValidationSampler first step CFG branch: "
+                            f"{_tensor_summary('neg_video', neg_video)} "
+                            f"{_tensor_summary('neg_audio', neg_audio)}"
+                        )
 
                     denoised_video = denoised_video + cfg_guider.delta(pos_video, neg_video)
                     if audio is not None and denoised_audio is not None:
@@ -617,16 +679,27 @@ class ValidationSampler:
                 # Update progress
                 if self._sampling_context is not None:
                     self._sampling_context.advance_step()
+                logger.debug(
+                    f"ValidationSampler step {step_idx + 1}/{len(sigmas) - 1}: "
+                    f"sigma={float(sigma):.6f} elapsed={time.perf_counter() - step_start_time:.3f}s "
+                    f"video_latent_dtype={video_state.latent.dtype} video_latent_device={video_state.latent.device}"
+                )
 
         return video_state, audio_state
 
     @staticmethod
     def _resolve_sigmas(config: GenerationConfig, device: torch.device) -> torch.Tensor:
         if config.sample_sigmas is not None:
+            logger.info(f"ValidationSampler using explicit sample_sigmas: {config.sample_sigmas}")
             return torch.tensor(config.sample_sigmas, device=device, dtype=torch.float32)
 
         scheduler = LTX2Scheduler()
-        return scheduler.execute(steps=config.num_inference_steps).to(device).float()
+        resolved = scheduler.execute(steps=config.num_inference_steps).to(device).float()
+        logger.info(
+            f"ValidationSampler using scheduler-generated sigmas for {config.num_inference_steps} steps: "
+            f"{resolved.detach().cpu().tolist()}"
+        )
+        return resolved
 
     @staticmethod
     def _build_stg_perturbation_config(config: GenerationConfig) -> BatchedPerturbationConfig:
@@ -725,9 +798,17 @@ class ValidationSampler:
             a_ctx_pos = cached.audio_context_positive.to(device)
             v_ctx_neg = cached.video_context_negative.to(device) if cached.video_context_negative is not None else None
             a_ctx_neg = cached.audio_context_negative.to(device) if cached.audio_context_negative is not None else None
+            logger.info(
+                "ValidationSampler using cached prompt embeddings: "
+                f"{_tensor_summary('v_ctx_pos', v_ctx_pos)} "
+                f"{_tensor_summary('a_ctx_pos', a_ctx_pos)} "
+                f"{_tensor_summary('v_ctx_neg', v_ctx_neg)} "
+                f"{_tensor_summary('a_ctx_neg', a_ctx_neg)}"
+            )
             return v_ctx_pos, a_ctx_pos, v_ctx_neg, a_ctx_neg
 
         # Fall back to encoding on-the-fly
+        logger.info("ValidationSampler encoding prompts on-the-fly")
         return self._encode_prompts(config, device)
 
     def _encode_prompts(

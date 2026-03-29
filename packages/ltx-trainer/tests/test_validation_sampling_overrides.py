@@ -127,6 +127,26 @@ class ValidationSamplingOverrideTests(unittest.TestCase):
         self.assertEqual(config.alpha_pattern["transformer_blocks.0.attn1.to_q"], 16)
         self.assertEqual(config.alpha_pattern["transformer_blocks.0.attn2.to_v"], 28)
 
+    def test_summarize_validation_sampling_lora_state_dict_reports_dynamic_shapes(self) -> None:
+        state_dict = {
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_A.weight": torch.randn(4, 8, dtype=torch.bfloat16),
+            "diffusion_model.transformer_blocks.0.attn1.to_q.lora_B.weight": torch.randn(8, 4, dtype=torch.bfloat16),
+            "diffusion_model.transformer_blocks.0.attn1.to_q.alpha": torch.tensor(16.0),
+            "diffusion_model.transformer_blocks.1.attn2.to_v.lora_A.weight": torch.randn(7, 8, dtype=torch.float16),
+            "diffusion_model.transformer_blocks.1.attn2.to_v.lora_B.weight": torch.randn(8, 7, dtype=torch.float16),
+            "diffusion_model.transformer_blocks.1.attn2.to_v.alpha": torch.tensor(28.0),
+        }
+
+        summary = TRAINER_MODULE.summarize_external_lora_state_dict(
+            TRAINER_MODULE.normalize_external_lora_state_dict(state_dict)
+        )
+
+        self.assertEqual(summary["target_module_count"], 2)
+        self.assertEqual(summary["rank_range"], (4, 7))
+        self.assertEqual(summary["alpha_range"], (16, 28))
+        self.assertEqual(summary["tensor_dtype_counts"]["torch.bfloat16"], 2)
+        self.assertEqual(summary["tensor_dtype_counts"]["torch.float16"], 2)
+
     def test_validation_sampling_lora_scope_applies_mix_and_restores_default(self) -> None:
         trainer = TRAINER_MODULE.LtxvTrainer.__new__(TRAINER_MODULE.LtxvTrainer)
         trainer._config = type(

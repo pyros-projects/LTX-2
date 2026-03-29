@@ -155,6 +155,27 @@ def build_lora_config_from_state_dict(state_dict: dict[str, Tensor]) -> LoraConf
     )
 
 
+def summarize_external_lora_state_dict(state_dict: dict[str, Tensor]) -> dict[str, object]:
+    """Return a compact summary useful for debug logging of external LoRA checkpoints."""
+    target_modules = extract_lora_target_modules(state_dict)
+    rank_values = [
+        int(value.shape[0])
+        for key, value in state_dict.items()
+        if key.endswith(".lora_A.weight") and value.ndim == 2
+    ]
+    alpha_values = [int(float(value.item())) for key, value in state_dict.items() if key.endswith(".alpha")]
+    tensor_dtype_counts = Counter(str(value.dtype) for value in state_dict.values() if isinstance(value, torch.Tensor))
+    tensor_device_counts = Counter(str(value.device) for value in state_dict.values() if isinstance(value, torch.Tensor))
+
+    return {
+        "target_module_count": len(target_modules),
+        "rank_range": (min(rank_values), max(rank_values)) if rank_values else None,
+        "alpha_range": (min(alpha_values), max(alpha_values)) if alpha_values else None,
+        "tensor_dtype_counts": dict(tensor_dtype_counts),
+        "tensor_device_counts": dict(tensor_device_counts),
+    }
+
+
 def should_enable_block_swap(
     distributed_type: DistributedType,
     training_mode: str,
@@ -708,6 +729,10 @@ class LtxvTrainer:
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
         )
+        logger.info(
+            "Validation embedding cache: text encoder loaded "
+            f"(8bit={self._config.acceleration.load_text_encoder_in_8bit})"
+        )
 
         # Load embeddings processor (feature extractor + connectors)
         logger.debug("Loading embeddings processor...")
@@ -716,6 +741,7 @@ class LtxvTrainer:
             device="cuda",
             dtype=torch.bfloat16,
         )
+        logger.info("Validation embedding cache: embeddings processor loaded on cuda with bf16")
 
         # Cache validation embeddings if prompts are configured
         cached_embeddings = None
@@ -739,6 +765,15 @@ class LtxvTrainer:
                                 neg_out.audio_encoding.cpu() if neg_out.audio_encoding is not None else None
                             ),
                         )
+                    )
+                if cached_embeddings:
+                    first_cached = cached_embeddings[0]
+                    logger.info(
+                        "Validation embedding cache summary: "
+                        f"video_pos_shape={tuple(first_cached.video_context_positive.shape)} "
+                        f"video_pos_dtype={first_cached.video_context_positive.dtype} "
+                        f"audio_pos_shape={tuple(first_cached.audio_context_positive.shape)} "
+                        f"audio_pos_dtype={first_cached.audio_context_positive.dtype}"
                     )
 
         # Unload Gemma model and feature extractor, keep only connectors for training
@@ -866,11 +901,19 @@ class LtxvTrainer:
         if adapter_name not in transformer.peft_config or loaded_path != current_path:
             state_dict = normalize_external_lora_state_dict(load_file(str(lora_path)))
             lora_config = build_lora_config_from_state_dict(state_dict)
+            state_summary = summarize_external_lora_state_dict(state_dict)
             adapter_state_dict = {k: v for k, v in state_dict.items() if not k.endswith(".alpha")}
             transformer.add_adapter(adapter_name, lora_config)
             set_peft_model_state_dict(transformer, adapter_state_dict, adapter_name=adapter_name)
             transformer.set_requires_grad(adapter_name, False)
             self._validation_sampling_lora_path = current_path
+            logger.info(
+                "Validation sampling LoRA loaded: "
+                f"path={current_path} target_modules={state_summary['target_module_count']} "
+                f"rank_range={state_summary['rank_range']} alpha_range={state_summary['alpha_range']} "
+                f"tensor_dtypes={state_summary['tensor_dtype_counts']} "
+                f"tensor_devices={state_summary['tensor_device_counts']}"
+            )
 
         return adapter_name
 
@@ -894,6 +937,10 @@ class LtxvTrainer:
         if mix_adapter in transformer.peft_config:
             transformer.delete_adapter(mix_adapter)
 
+        logger.info(
+            "Activating validation sampling LoRA mix: "
+            f"train_adapter={active_adapter} sampling_adapter={sampling_adapter} multiplier={multiplier}"
+        )
         transformer.base_model.add_weighted_adapter(
             [active_adapter, sampling_adapter],
             [1.0, multiplier],
@@ -902,6 +949,10 @@ class LtxvTrainer:
         )
         transformer.set_adapter(mix_adapter)
         transformer.set_requires_grad(mix_adapter, False)
+        logger.debug(
+            f"Validation sampling adapter state: active={getattr(transformer, 'active_adapter', None)} "
+            f"available={sorted(getattr(transformer, 'peft_config', {}).keys())}"
+        )
 
         try:
             yield
@@ -910,6 +961,10 @@ class LtxvTrainer:
                 transformer.set_adapter(active_adapter)
             if hasattr(transformer, "delete_adapter"):
                 transformer.delete_adapter(mix_adapter)
+            logger.debug(
+                f"Validation sampling adapter restored: active={getattr(transformer, 'active_adapter', None)} "
+                f"available={sorted(getattr(transformer, 'peft_config', {}).keys())}"
+            )
 
     def _load_checkpoint(self) -> None:
         """Load checkpoint if specified in config."""
@@ -1229,10 +1284,19 @@ class LtxvTrainer:
         inference_steps = (
             len(sample_sigmas) - 1 if sample_sigmas is not None else self._config.validation.inference_steps
         )
+        logger.info(
+            "Starting validation sampling: "
+            f"prompts={len(self._config.validation.prompts)} steps={inference_steps} "
+            f"custom_sigmas={'yes' if sample_sigmas is not None else 'no'} "
+            f"sampling_lora={'yes' if self._config.validation.sampling_lora_weight is not None else 'no'}"
+        )
+        if sample_sigmas is not None:
+            logger.info(f"Validation sampling sigmas: {sample_sigmas}")
 
         # Zero gradients and free GPU memory to reclaim memory before validation sampling
         self._optimizer.zero_grad(set_to_none=True)
         free_gpu_memory()
+        self._log_transformer_device_summary("before_validation_sampling")
 
         # Start sampling progress tracking
         sampling_ctx = progress.start_sampling(
@@ -1266,6 +1330,10 @@ class LtxvTrainer:
             for prompt_idx, prompt in enumerate(self._config.validation.prompts):
                 # Update progress to show current video
                 sampling_ctx.start_video(prompt_idx)
+                logger.info(
+                    f"Validation prompt {prompt_idx + 1}/{len(self._config.validation.prompts)} "
+                    f"(cached_embeddings={'yes' if self._cached_validation_embeddings is not None else 'no'})"
+                )
 
                 # Load conditioning image if provided
                 condition_image = None
@@ -1313,9 +1381,14 @@ class LtxvTrainer:
                 )
 
                 # Generate sample
+                prompt_start_time = time.perf_counter()
                 video, audio = sampler.generate(
                     config=gen_config,
                     device=self._accelerator.device,
+                )
+                logger.info(
+                    f"Validation prompt {prompt_idx + 1} sampling finished in "
+                    f"{time.perf_counter() - prompt_start_time:.2f}s"
                 )
 
                 # Save output (image for single frame, video otherwise)
@@ -1336,6 +1409,7 @@ class LtxvTrainer:
 
         # Clean up progress tasks
         sampling_ctx.cleanup()
+        self._log_transformer_device_summary("after_validation_sampling")
 
         rel_outputs_path = output_dir.relative_to(self._config.output_dir)
         logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
