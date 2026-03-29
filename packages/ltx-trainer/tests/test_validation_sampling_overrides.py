@@ -165,7 +165,7 @@ class ValidationSamplingOverrideTests(unittest.TestCase):
         self.assertEqual(summary["tensor_dtype_counts"]["torch.bfloat16"], 2)
         self.assertEqual(summary["tensor_dtype_counts"]["torch.float16"], 2)
 
-    def test_validation_sampling_lora_scope_applies_mix_and_restores_default(self) -> None:
+    def test_validation_sampling_lora_scope_applies_mix_restores_default_and_unloads_sampling_adapter(self) -> None:
         trainer = TRAINER_MODULE.LtxvTrainer.__new__(TRAINER_MODULE.LtxvTrainer)
         trainer._config = type(
             "Config",
@@ -201,7 +201,7 @@ class ValidationSamplingOverrideTests(unittest.TestCase):
                 )
 
         mock_set_state.assert_called_once()
-        self.assertIn("__validation_sampling__", transformer.peft_config)
+        self.assertNotIn("__validation_sampling__", transformer.peft_config)
         self.assertEqual(transformer.base_model.weighted_calls, [])
         self.assertEqual(
             transformer.base_model.set_calls,
@@ -210,6 +210,7 @@ class ValidationSamplingOverrideTests(unittest.TestCase):
                 ("default", False),
             ],
         )
+        self.assertEqual(transformer.deleted, ["__validation_sampling__"])
         self.assertEqual(transformer.active_adapter, "default")
         self.assertEqual(transformer.base_model.model.lora_layer.scaling["__validation_sampling__"], 2.0)
 

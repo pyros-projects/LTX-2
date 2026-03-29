@@ -947,11 +947,21 @@ class LtxvTrainer:
 
             state_apply_start_time = time.perf_counter()
             logger.info(f"Validation sampling LoRA: calling set_peft_model_state_dict({adapter_name})")
-            set_peft_model_state_dict(transformer, adapter_state_dict, adapter_name=adapter_name)
+            load_result = set_peft_model_state_dict(transformer, adapter_state_dict, adapter_name=adapter_name)
             logger.info(
                 "Validation sampling LoRA: set_peft_model_state_dict completed in "
                 f"{time.perf_counter() - state_apply_start_time:.2f}s"
             )
+            missing_keys = list(getattr(load_result, "missing_keys", []) or [])
+            unexpected_keys = list(getattr(load_result, "unexpected_keys", []) or [])
+            if missing_keys or unexpected_keys:
+                logger.warning(
+                    "Validation sampling LoRA: state load reported "
+                    f"missing_keys={len(missing_keys)} unexpected_keys={len(unexpected_keys)} "
+                    f"sample_missing={missing_keys[:5]} sample_unexpected={unexpected_keys[:5]}"
+                )
+            else:
+                logger.info("Validation sampling LoRA: state load matched all injected adapter weights")
 
             freeze_start_time = time.perf_counter()
             transformer.set_requires_grad(adapter_name, False)
@@ -1028,6 +1038,9 @@ class LtxvTrainer:
             for module, original_scaling in scaled_modules:
                 module.scaling[sampling_adapter] = original_scaling
             transformer.base_model.set_adapter(active_adapter, inference_mode=False)
+            transformer.delete_adapter(sampling_adapter)
+            self._validation_sampling_lora_path = None
+            free_gpu_memory()
             logger.debug(
                 "Validation sampling adapter restored: "
                 f"top_level_active={getattr(transformer, 'active_adapter', None)} "
