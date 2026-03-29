@@ -194,10 +194,7 @@ class ValidationSamplingOverrideTests(unittest.TestCase):
             patch.object(TRAINER_MODULE, "set_peft_model_state_dict") as mock_set_state,
         ):
             with trainer._validation_sampling_lora_scope(transformer):
-                self.assertEqual(
-                    transformer.active_adapter,
-                    ["default", "__validation_sampling__"],
-                )
+                self.assertEqual(transformer.active_adapter, "default")
                 self.assertEqual(
                     transformer.base_model.model.lora_layer.scaling["__validation_sampling__"],
                     1.2,

@@ -1011,13 +1011,14 @@ class LtxvTrainer:
 
         set_active_start_time = time.perf_counter()
         transformer.base_model.set_adapter(combined_adapters, inference_mode=True)
-        transformer.active_adapter = combined_adapters
         logger.info(
             f"Validation sampling LoRA: set_adapter({combined_adapters}) completed in "
             f"{time.perf_counter() - set_active_start_time:.2f}s"
         )
         logger.debug(
-            f"Validation sampling adapter state: active={getattr(transformer, 'active_adapter', None)} "
+            "Validation sampling adapter state: "
+            f"top_level_active={getattr(transformer, 'active_adapter', None)} "
+            f"base_active={combined_adapters} "
             f"available={sorted(getattr(transformer, 'peft_config', {}).keys())}"
         )
 
@@ -1027,9 +1028,10 @@ class LtxvTrainer:
             for module, original_scaling in scaled_modules:
                 module.scaling[sampling_adapter] = original_scaling
             transformer.base_model.set_adapter(active_adapter, inference_mode=False)
-            transformer.active_adapter = active_adapter
             logger.debug(
-                f"Validation sampling adapter restored: active={getattr(transformer, 'active_adapter', None)} "
+                "Validation sampling adapter restored: "
+                f"top_level_active={getattr(transformer, 'active_adapter', None)} "
+                f"base_active={active_adapter} "
                 f"available={sorted(getattr(transformer, 'peft_config', {}).keys())}"
             )
 
