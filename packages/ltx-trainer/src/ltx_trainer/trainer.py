@@ -894,18 +894,71 @@ class LtxvTrainer:
         adapter_name = "__validation_sampling__"
         current_path = str(lora_path)
         loaded_path = getattr(self, "_validation_sampling_lora_path", None)
+        logger.info(
+            "Preparing validation sampling LoRA adapter load: "
+            f"path={current_path} transformer_type={type(transformer).__name__} "
+            f"active_adapter={getattr(transformer, 'active_adapter', None)} "
+            f"loaded_path={loaded_path}"
+        )
 
         if adapter_name in transformer.peft_config and loaded_path != current_path:
             transformer.delete_adapter(adapter_name)
 
         if adapter_name not in transformer.peft_config or loaded_path != current_path:
-            state_dict = normalize_external_lora_state_dict(load_file(str(lora_path)))
+            load_start_time = time.perf_counter()
+            logger.info(f"Validation sampling LoRA: loading safetensors from {current_path}")
+            raw_state_dict = load_file(str(lora_path))
+            logger.info(
+                f"Validation sampling LoRA: load_file completed in "
+                f"{time.perf_counter() - load_start_time:.2f}s with {len(raw_state_dict)} tensors"
+            )
+
+            normalize_start_time = time.perf_counter()
+            state_dict = normalize_external_lora_state_dict(raw_state_dict)
+            logger.info(
+                "Validation sampling LoRA: state dict normalized in "
+                f"{time.perf_counter() - normalize_start_time:.2f}s"
+            )
+
+            config_start_time = time.perf_counter()
             lora_config = build_lora_config_from_state_dict(state_dict)
             state_summary = summarize_external_lora_state_dict(state_dict)
+            logger.info(
+                "Validation sampling LoRA: PEFT config built in "
+                f"{time.perf_counter() - config_start_time:.2f}s "
+                f"(targets={state_summary['target_module_count']} rank_range={state_summary['rank_range']} "
+                f"alpha_range={state_summary['alpha_range']})"
+            )
+
             adapter_state_dict = {k: v for k, v in state_dict.items() if not k.endswith(".alpha")}
+            logger.info(
+                "Validation sampling LoRA: adapter state prepared "
+                f"(tensor_count={len(adapter_state_dict)} dtypes={state_summary['tensor_dtype_counts']} "
+                f"devices={state_summary['tensor_device_counts']})"
+            )
+
+            add_adapter_start_time = time.perf_counter()
+            logger.info(f"Validation sampling LoRA: calling add_adapter({adapter_name})")
             transformer.add_adapter(adapter_name, lora_config)
+            logger.info(
+                f"Validation sampling LoRA: add_adapter completed in "
+                f"{time.perf_counter() - add_adapter_start_time:.2f}s"
+            )
+
+            state_apply_start_time = time.perf_counter()
+            logger.info(f"Validation sampling LoRA: calling set_peft_model_state_dict({adapter_name})")
             set_peft_model_state_dict(transformer, adapter_state_dict, adapter_name=adapter_name)
+            logger.info(
+                "Validation sampling LoRA: set_peft_model_state_dict completed in "
+                f"{time.perf_counter() - state_apply_start_time:.2f}s"
+            )
+
+            freeze_start_time = time.perf_counter()
             transformer.set_requires_grad(adapter_name, False)
+            logger.info(
+                f"Validation sampling LoRA: set_requires_grad(False) completed in "
+                f"{time.perf_counter() - freeze_start_time:.2f}s"
+            )
             self._validation_sampling_lora_path = current_path
             logger.info(
                 "Validation sampling LoRA loaded: "
@@ -941,14 +994,32 @@ class LtxvTrainer:
             "Activating validation sampling LoRA mix: "
             f"train_adapter={active_adapter} sampling_adapter={sampling_adapter} multiplier={multiplier}"
         )
+        weighted_start_time = time.perf_counter()
+        logger.info(f"Validation sampling LoRA: calling add_weighted_adapter({mix_adapter})")
         transformer.base_model.add_weighted_adapter(
             [active_adapter, sampling_adapter],
             [1.0, multiplier],
             adapter_name=mix_adapter,
             combination_type="cat",
         )
+        logger.info(
+            f"Validation sampling LoRA: add_weighted_adapter completed in "
+            f"{time.perf_counter() - weighted_start_time:.2f}s"
+        )
+
+        set_active_start_time = time.perf_counter()
         transformer.set_adapter(mix_adapter)
+        logger.info(
+            f"Validation sampling LoRA: set_adapter({mix_adapter}) completed in "
+            f"{time.perf_counter() - set_active_start_time:.2f}s"
+        )
+
+        freeze_mix_start_time = time.perf_counter()
         transformer.set_requires_grad(mix_adapter, False)
+        logger.info(
+            "Validation sampling LoRA: set_requires_grad(False) for mix adapter completed in "
+            f"{time.perf_counter() - freeze_mix_start_time:.2f}s"
+        )
         logger.debug(
             f"Validation sampling adapter state: active={getattr(transformer, 'active_adapter', None)} "
             f"available={sorted(getattr(transformer, 'peft_config', {}).keys())}"
