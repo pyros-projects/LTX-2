@@ -1,7 +1,9 @@
 import os
+import re
 import time
 import warnings
 from collections import Counter
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -99,6 +101,58 @@ def should_keep_quantized_model_on_device(
 def get_base_transformer_model(transformer: torch.nn.Module) -> torch.nn.Module:
     """Return the underlying transformer model when wrapped by PEFT."""
     return transformer.get_base_model() if hasattr(transformer, "get_base_model") else transformer
+
+
+def normalize_external_lora_state_dict(state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+    """Normalize external LoRA checkpoints to PEFT-compatible key names."""
+    return {k.replace("diffusion_model.", "", 1): v for k, v in state_dict.items()}
+
+
+def extract_lora_target_modules(state_dict: dict[str, Tensor]) -> list[str]:
+    """Extract full target module paths from LoRA A/B keys."""
+    pattern = re.compile(r"(.+)\.lora_[AB]\.weight$")
+    target_modules = {
+        match.group(1)
+        for key in state_dict
+        if (match := pattern.match(key)) is not None
+    }
+    if not target_modules:
+        raise ValueError("Could not extract target modules from LoRA state dict")
+    return sorted(target_modules)
+
+
+def build_lora_config_from_state_dict(state_dict: dict[str, Tensor]) -> LoraConfig:
+    """Build a PEFT LoRA config from an external checkpoint with possibly dynamic ranks/alphas."""
+    target_modules = extract_lora_target_modules(state_dict)
+    rank_pattern: dict[str, int] = {}
+    alpha_pattern: dict[str, int] = {}
+
+    for key, value in state_dict.items():
+        if key.endswith(".lora_A.weight") and value.ndim == 2:
+            module_name = key[: -len(".lora_A.weight")]
+            rank_pattern[module_name] = int(value.shape[0])
+        elif key.endswith(".alpha"):
+            module_name = key[: -len(".alpha")]
+            alpha_pattern[module_name] = int(float(value.item()))
+
+    if not rank_pattern:
+        raise ValueError("Could not infer LoRA rank pattern from state dict")
+
+    for module_name, rank in rank_pattern.items():
+        alpha_pattern.setdefault(module_name, rank)
+
+    default_rank = max(rank_pattern.values())
+    default_alpha = max(alpha_pattern.values()) if alpha_pattern else default_rank
+
+    return LoraConfig(
+        r=default_rank,
+        lora_alpha=default_alpha,
+        target_modules=target_modules,
+        lora_dropout=0.0,
+        init_lora_weights=True,
+        rank_pattern=rank_pattern,
+        alpha_pattern=alpha_pattern,
+    )
 
 
 def should_enable_block_swap(
@@ -203,6 +257,7 @@ class LtxvTrainer:
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
+        self._validation_sampling_lora_path: str | None = None
         self._cached_validation_embeddings = self._time_init_stage(
             "cache_validation_embeddings",
             self._load_text_encoder_and_cache_embeddings,
@@ -790,6 +845,72 @@ class LtxvTrainer:
         # noinspection PyTypeChecker
         self._transformer = get_peft_model(self._transformer, lora_config)
 
+    def _ensure_validation_sampling_lora_adapter_loaded(self, transformer: torch.nn.Module) -> str | None:
+        """Load the validation-only sampling LoRA as a non-trainable PEFT adapter when configured."""
+        lora_path = getattr(self._config.validation, "sampling_lora_weight", None)
+        if lora_path is None:
+            return None
+
+        if self._config.model.training_mode != "lora":
+            raise ValueError("validation.sampling_lora_weight is currently supported only for LoRA training mode.")
+        if not hasattr(transformer, "add_adapter") or not hasattr(transformer, "peft_config"):
+            raise TypeError("Validation sampling LoRA requires a PEFT-wrapped transformer.")
+
+        adapter_name = "__validation_sampling__"
+        current_path = str(lora_path)
+        loaded_path = getattr(self, "_validation_sampling_lora_path", None)
+
+        if adapter_name in transformer.peft_config and loaded_path != current_path:
+            transformer.delete_adapter(adapter_name)
+
+        if adapter_name not in transformer.peft_config or loaded_path != current_path:
+            state_dict = normalize_external_lora_state_dict(load_file(str(lora_path)))
+            lora_config = build_lora_config_from_state_dict(state_dict)
+            adapter_state_dict = {k: v for k, v in state_dict.items() if not k.endswith(".alpha")}
+            transformer.add_adapter(adapter_name, lora_config)
+            set_peft_model_state_dict(transformer, adapter_state_dict, adapter_name=adapter_name)
+            transformer.set_requires_grad(adapter_name, False)
+            self._validation_sampling_lora_path = current_path
+
+        return adapter_name
+
+    @contextmanager
+    def _validation_sampling_lora_scope(self, transformer: torch.nn.Module):
+        """Temporarily activate a weighted validation adapter combining training and sampling LoRAs."""
+        sampling_lora_path = getattr(self._config.validation, "sampling_lora_weight", None)
+        if sampling_lora_path is None:
+            yield
+            return
+
+        sampling_adapter = self._ensure_validation_sampling_lora_adapter_loaded(transformer)
+        if sampling_adapter is None:
+            yield
+            return
+
+        active_adapter = getattr(transformer, "active_adapter", "default")
+        mix_adapter = "__validation_sampling_mix__"
+        multiplier = float(getattr(self._config.validation, "sampling_lora_multiplier", 1.0))
+
+        if mix_adapter in transformer.peft_config:
+            transformer.delete_adapter(mix_adapter)
+
+        transformer.base_model.add_weighted_adapter(
+            [active_adapter, sampling_adapter],
+            [1.0, multiplier],
+            adapter_name=mix_adapter,
+            combination_type="cat",
+        )
+        transformer.set_adapter(mix_adapter)
+        transformer.set_requires_grad(mix_adapter, False)
+
+        try:
+            yield
+        finally:
+            if active_adapter in transformer.peft_config:
+                transformer.set_adapter(active_adapter)
+            if hasattr(transformer, "delete_adapter"):
+                transformer.delete_adapter(mix_adapter)
+
     def _load_checkpoint(self) -> None:
         """Load checkpoint if specified in config."""
         if not self._config.model.load_checkpoint:
@@ -1104,7 +1225,10 @@ class LtxvTrainer:
         use_images = self._config.validation.images is not None
         use_reference_videos = self._config.validation.reference_videos is not None
         generate_audio = self._config.validation.generate_audio
-        inference_steps = self._config.validation.inference_steps
+        sample_sigmas = self._config.validation.sample_sigmas
+        inference_steps = (
+            len(sample_sigmas) - 1 if sample_sigmas is not None else self._config.validation.inference_steps
+        )
 
         # Zero gradients and free GPU memory to reclaim memory before validation sampling
         self._optimizer.zero_grad(set_to_none=True)
@@ -1132,76 +1256,83 @@ class LtxvTrainer:
 
         video_paths = []
         width, height, num_frames = self._config.validation.video_dims
+        sampling_transformer = (
+            self._accelerator.unwrap_model(self._transformer)
+            if hasattr(self._accelerator, "unwrap_model")
+            else self._transformer
+        )
 
-        for prompt_idx, prompt in enumerate(self._config.validation.prompts):
-            # Update progress to show current video
-            sampling_ctx.start_video(prompt_idx)
+        with self._validation_sampling_lora_scope(sampling_transformer):
+            for prompt_idx, prompt in enumerate(self._config.validation.prompts):
+                # Update progress to show current video
+                sampling_ctx.start_video(prompt_idx)
 
-            # Load conditioning image if provided
-            condition_image = None
-            if use_images:
-                image_path = self._config.validation.images[prompt_idx]
-                image = open_image_as_srgb(image_path)
-                # Convert PIL image to tensor [C, H, W] in [0, 1]
-                condition_image = F.to_tensor(image)
+                # Load conditioning image if provided
+                condition_image = None
+                if use_images:
+                    image_path = self._config.validation.images[prompt_idx]
+                    image = open_image_as_srgb(image_path)
+                    # Convert PIL image to tensor [C, H, W] in [0, 1]
+                    condition_image = F.to_tensor(image)
 
-            # Load reference video if provided (for IC-LoRA)
-            reference_video = None
-            if use_reference_videos:
-                ref_video_path = self._config.validation.reference_videos[prompt_idx]
-                # read_video returns [F, C, H, W] in [0, 1]
-                reference_video, _ = read_video(ref_video_path, max_frames=num_frames)
+                # Load reference video if provided (for IC-LoRA)
+                reference_video = None
+                if use_reference_videos:
+                    ref_video_path = self._config.validation.reference_videos[prompt_idx]
+                    # read_video returns [F, C, H, W] in [0, 1]
+                    reference_video, _ = read_video(ref_video_path, max_frames=num_frames)
 
-            # Get cached embeddings for this prompt if available
-            cached_embeddings = (
-                self._cached_validation_embeddings[prompt_idx]
-                if self._cached_validation_embeddings is not None
-                else None
-            )
+                # Get cached embeddings for this prompt if available
+                cached_embeddings = (
+                    self._cached_validation_embeddings[prompt_idx]
+                    if self._cached_validation_embeddings is not None
+                    else None
+                )
 
-            # Create generation config
-            gen_config = GenerationConfig(
-                prompt=prompt,
-                negative_prompt=self._config.validation.negative_prompt,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=self._config.validation.frame_rate,
-                num_inference_steps=inference_steps,
-                guidance_scale=self._config.validation.guidance_scale,
-                seed=self._config.validation.seed,
-                condition_image=condition_image,
-                reference_video=reference_video,
-                reference_downscale_factor=self._config.validation.reference_downscale_factor,
-                generate_audio=generate_audio,
-                include_reference_in_output=self._config.validation.include_reference_in_output,
-                cached_embeddings=cached_embeddings,
-                stg_scale=self._config.validation.stg_scale,
-                stg_blocks=self._config.validation.stg_blocks,
-                stg_mode=self._config.validation.stg_mode,
-            )
+                # Create generation config
+                gen_config = GenerationConfig(
+                    prompt=prompt,
+                    negative_prompt=self._config.validation.negative_prompt,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=self._config.validation.frame_rate,
+                    num_inference_steps=inference_steps,
+                    guidance_scale=self._config.validation.guidance_scale,
+                    sample_sigmas=sample_sigmas,
+                    seed=self._config.validation.seed,
+                    condition_image=condition_image,
+                    reference_video=reference_video,
+                    reference_downscale_factor=self._config.validation.reference_downscale_factor,
+                    generate_audio=generate_audio,
+                    include_reference_in_output=self._config.validation.include_reference_in_output,
+                    cached_embeddings=cached_embeddings,
+                    stg_scale=self._config.validation.stg_scale,
+                    stg_blocks=self._config.validation.stg_blocks,
+                    stg_mode=self._config.validation.stg_mode,
+                )
 
-            # Generate sample
-            video, audio = sampler.generate(
-                config=gen_config,
-                device=self._accelerator.device,
-            )
+                # Generate sample
+                video, audio = sampler.generate(
+                    config=gen_config,
+                    device=self._accelerator.device,
+                )
 
-            # Save output (image for single frame, video otherwise)
-            if IS_MAIN_PROCESS:
-                ext = "png" if num_frames == 1 else "mp4"
-                output_path = output_dir / f"step_{self._global_step:06d}_{prompt_idx + 1}.{ext}"
-                if num_frames == 1:
-                    save_image(video, output_path)
-                else:
-                    save_video(
-                        video_tensor=video,
-                        output_path=output_path,
-                        fps=self._config.validation.frame_rate,
-                        audio=audio,
-                        audio_sample_rate=self._vocoder.output_sampling_rate if audio is not None else None,
-                    )
-                video_paths.append(output_path)
+                # Save output (image for single frame, video otherwise)
+                if IS_MAIN_PROCESS:
+                    ext = "png" if num_frames == 1 else "mp4"
+                    output_path = output_dir / f"step_{self._global_step:06d}_{prompt_idx + 1}.{ext}"
+                    if num_frames == 1:
+                        save_image(video, output_path)
+                    else:
+                        save_video(
+                            video_tensor=video,
+                            output_path=output_path,
+                            fps=self._config.validation.frame_rate,
+                            audio=audio,
+                            audio_sample_rate=self._vocoder.output_sampling_rate if audio is not None else None,
+                        )
+                    video_paths.append(output_path)
 
         # Clean up progress tasks
         sampling_ctx.cleanup()

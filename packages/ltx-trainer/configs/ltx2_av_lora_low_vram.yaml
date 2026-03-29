@@ -227,6 +227,15 @@ validation:
   # Higher values = better quality but slower generation
   inference_steps: 30
 
+  # Optional: explicit sigma schedule for validation sampling
+  # When set, overrides the default LTX scheduler and implies len(sample_sigmas) - 1 denoising steps
+  # sample_sigmas: [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0]
+
+  # Optional: validation-only sampling LoRA for preview generations
+  # This is useful for distilled sampling LoRAs without affecting training weights
+  # sampling_lora_weight: "/home/pyro/models/comfy/loras/ltx/ltx-2.3-22b-distilled-lora-dynamic_fro09_avg_rank_105_bf16.safetensors"
+  # sampling_lora_multiplier: 0.6
+
   # Generate validation videos every N training steps
   # Set to null to disable validation during training
   interval: 100

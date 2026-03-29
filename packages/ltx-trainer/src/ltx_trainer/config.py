@@ -1,3 +1,4 @@
+import math
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -287,6 +288,22 @@ class ValidationConfig(ConfigBaseModel):
         ge=1.0,
     )
 
+    sample_sigmas: list[float] | None = Field(
+        default=None,
+        description="Optional explicit sigma schedule for validation sampling. "
+        "When set, overrides the default LTX scheduler and implies len(sample_sigmas) - 1 denoising steps.",
+    )
+
+    sampling_lora_weight: str | Path | None = Field(
+        default=None,
+        description="Optional LoRA weights to apply only during validation sampling.",
+    )
+
+    sampling_lora_multiplier: float = Field(
+        default=1.0,
+        description="Strength multiplier for the validation-only sampling LoRA.",
+    )
+
     stg_scale: float = Field(
         default=1.0,
         description="STG (Spatio-Temporal Guidance) scale. 0.0 disables STG. "
@@ -356,6 +373,34 @@ class ValidationConfig(ConfigBaseModel):
             if not Path(video_path).exists():
                 raise ValueError(f"Reference video path '{video_path}' does not exist")
 
+        return v
+
+    @field_validator("sample_sigmas")
+    @classmethod
+    def validate_sample_sigmas(cls, v: list[float] | None) -> list[float] | None:
+        if v is None:
+            return None
+        if len(v) < 2:
+            raise ValueError("sample_sigmas must contain at least two values.")
+
+        normalized = [float(sigma) for sigma in v]
+        for idx, sigma in enumerate(normalized):
+            if not math.isfinite(sigma):
+                raise ValueError(f"sample_sigmas contains non-finite value at index {idx}: {sigma}")
+            if sigma < 0.0 or sigma > 1.0:
+                raise ValueError(f"sample_sigmas values must be within [0, 1]. Got {sigma} at index {idx}.")
+        if any(curr < nxt for curr, nxt in zip(normalized, normalized[1:])):
+            raise ValueError("sample_sigmas must be monotonically non-increasing.")
+
+        return normalized
+
+    @field_validator("sampling_lora_weight")
+    @classmethod
+    def validate_sampling_lora_weight(cls, v: str | Path | None) -> str | Path | None:
+        if v is None:
+            return None
+        if not Path(v).exists():
+            raise ValueError(f"Sampling LoRA path '{v}' does not exist")
         return v
 
     @model_validator(mode="after")

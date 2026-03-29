@@ -83,6 +83,7 @@ class GenerationConfig:
     frame_rate: float = 25.0  # Frame rate for temporal position scaling
     num_inference_steps: int = 30  # Number of denoising steps
     guidance_scale: float = 4.0  # CFG guidance scale
+    sample_sigmas: list[float] | None = None  # Optional explicit sigma schedule override
     seed: int = 42  # Random seed for reproducibility
     condition_image: Tensor | None = None  # Optional first frame image for image-to-video
     reference_video: Tensor | None = None  # For IC-LoRA: [F, C, H, W] in [0, 1]
@@ -98,12 +99,34 @@ class GenerationConfig:
 
     def __post_init__(self) -> None:
         """Apply default tiled decoding config if not provided."""
+        if self.sample_sigmas is not None:
+            normalized_sigmas = self._normalize_sample_sigmas(self.sample_sigmas)
+            object.__setattr__(self, "sample_sigmas", normalized_sigmas)
+            object.__setattr__(self, "num_inference_steps", len(normalized_sigmas) - 1)
+
         if self.tiled_decoding is None:
             # Use default config with tiling enabled
             object.__setattr__(self, "tiled_decoding", TiledDecodingConfig())
         elif self.tiled_decoding is False:
             # Explicitly disabled - use config with enabled=False
             object.__setattr__(self, "tiled_decoding", TiledDecodingConfig(enabled=False))
+
+    @staticmethod
+    def _normalize_sample_sigmas(sample_sigmas: list[float]) -> list[float]:
+        if len(sample_sigmas) < 2:
+            raise ValueError("sample_sigmas must contain at least two values.")
+
+        normalized = [float(sigma) for sigma in sample_sigmas]
+        for idx, sigma in enumerate(normalized):
+            if not torch.isfinite(torch.tensor(sigma)):
+                raise ValueError(f"sample_sigmas contains non-finite value at index {idx}: {sigma}")
+            if sigma < 0.0 or sigma > 1.0:
+                raise ValueError(f"sample_sigmas values must be within [0, 1]. Got {sigma} at index {idx}.")
+
+        if any(curr < nxt for curr, nxt in zip(normalized, normalized[1:])):
+            raise ValueError("sample_sigmas must be monotonically non-increasing.")
+
+        return normalized
 
 
 class ValidationSampler:
@@ -488,8 +511,7 @@ class ValidationSampler:
         device: torch.device,
     ) -> tuple[LatentState, LatentState | None]:
         """Run the denoising loop using X0 prediction with CFG and optional STG."""
-        scheduler = LTX2Scheduler()
-        sigmas = scheduler.execute(steps=config.num_inference_steps).to(device).float()
+        sigmas = self._resolve_sigmas(config, device)
         stepper = EulerDiffusionStep()
         cfg_guider = CFGGuider(config.guidance_scale)
         stg_guider = STGGuider(config.stg_scale)
@@ -597,6 +619,14 @@ class ValidationSampler:
                     self._sampling_context.advance_step()
 
         return video_state, audio_state
+
+    @staticmethod
+    def _resolve_sigmas(config: GenerationConfig, device: torch.device) -> torch.Tensor:
+        if config.sample_sigmas is not None:
+            return torch.tensor(config.sample_sigmas, device=device, dtype=torch.float32)
+
+        scheduler = LTX2Scheduler()
+        return scheduler.execute(steps=config.num_inference_steps).to(device).float()
 
     @staticmethod
     def _build_stg_perturbation_config(config: GenerationConfig) -> BatchedPerturbationConfig:
